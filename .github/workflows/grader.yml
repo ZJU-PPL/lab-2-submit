@@ -1,0 +1,154 @@
+name: grader
+on:
+  issues:
+    types: [opened, edited]
+jobs:
+  grade:
+   runs-on: ubuntu-22.04
+   env:
+    CACHE_KEY: ppl-ocaml-env-lz4-20221001
+    IMAGE_PATH: ./ppl-ocaml-env.tar
+    COMPACTED_IMAGE_PATH: ./ppl-ocaml-env.tar.lz4
+    COMPACTED_IMAGE_URL: https://github.com/ZJU-PPL/ppl-ocaml-env/releases/download/20221001/ppl-ocaml-env.tar.lz4
+   steps:
+    - name: Early exit
+      if: ${{ contains(github.event.issue.body, '::early-exit::') }}
+      run: exit 1
+
+    - name: Get the code submitted
+      id: fetch-code
+      env:
+        TITLE: ${{ github.event.issue.title }}
+        CONTENT: ${{ github.event.issue.body }}
+      run: |
+        echo "$CONTENT"  | sed -r -n "s/\[.*\]\((.*)\)/\1/p" > url
+        wget -O stu-code.tar.gz.pgp $(cat url | tr -d '\r\n')
+        echo "::set-output name=MD5::$(md5sum -t stu-code.tar.gz.pgp)"
+        rm url
+  
+    - name: Checkout keys
+      uses: actions/checkout@v3
+      with:
+        repository: ZJU-PPL/graders
+        ref: key
+        token: ${{ secrets.GRADER_PAT }}
+        path: ./key/
+
+    - name: Decrypt the code
+      run: |
+        echo zjuppl | gpg2 --pinentry-mode loopback --passphrase-fd 0 --import ./key/key.asc
+        echo zjuppl | gpg2 --pinentry-mode loopback --passphrase-fd 0 -o stu-code.tar.gz --decrypt stu-code.tar.gz.pgp
+        mkdir -p ./src/stu/
+        tar xf stu-code.tar.gz --directory=./src/stu/
+
+    - name: Checkout the code of grader
+      uses: actions/checkout@v3
+      with:
+        repository: ZJU-PPL/graders
+        ref: lab-2
+        token: ${{ secrets.GRADER_PAT }}
+        path: ./src/grader/
+
+    - name: Make test script
+      run: |
+        cat <<EOT > run.sh
+        set -euxo pipefail
+        cp -r ./ ../work
+        cd ../work
+        cd ./stu
+        opam install . -y
+        cd ..
+        cd ./grader
+        timeout 10s dune exec grader
+        EOT
+        chmod +x run.sh
+        mv run.sh ./src/run.sh
+
+    - name: Try to use image cache
+      uses: actions/cache@v3
+      id: cache-env
+      with:
+        key: ${{ env.CACHE_KEY }}
+        path: ${{ env.COMPACTED_IMAGE_PATH }}
+
+    - name: Fetch compacted test image
+      if: ${{ steps.cache-env.outputs.cache-hit != 'true' }}
+      run: |
+        wget -O ${{ env.COMPACTED_IMAGE_PATH }} ${{ env.COMPACTED_IMAGE_URL }}
+
+    - name: Import test image
+      run: |
+        wget -O ./lz4 https://github.com/ZJU-PPL/ppl-ocaml-env/releases/download/20221001/lz4
+        chmod +x ./lz4
+        ./lz4 -d -c ${{ env.COMPACTED_IMAGE_PATH }} | docker load
+    
+    - name: Run the grader
+      id: grade-result
+      run: |
+        cat <<EOT > get_grade.py
+        import sys
+        found = False
+        for line in sys.stdin:
+            if line.rstrip('\r\n') == '===':
+                found = not found
+                continue
+            if found:
+                print(line.rstrip('\r\n'))
+        EOT
+        docker run -v ${{ github.workspace }}/src:/home/opam/src -w /home/opam/src ppl-ocaml-env:latest bash run.sh 2>&1 | tee run.log | python get_grade.py > result.txt
+        cat run.log
+        grep -F -x -q '===' run.log
+
+    - name: Set the result
+      id: final-result
+      uses: actions/github-script@v6
+      with:
+        result-encoding: string
+        script: |
+          let fs = require('fs');
+          return fs.readFileSync('./result.txt', { encoding:'utf8', flag:'r' });
+
+    - name: Feedback
+      uses: peter-evans/create-or-update-comment@v2
+      env:
+        RESULT: ${{ steps.final-result.outputs.result }}
+      with:
+        issue-number: ${{ github.event.issue.number }}
+        body: |
+          This is the test report of your code
+          ```
+          ${{ env.RESULT }}
+          ```
+    - name: Get current timestamp
+      id: timestamp
+      run: echo "::set-output name=TS::$(date -u +'%Y-%m-%d_%H-%M-%S_%s')"
+
+    - name: Encode the score
+      id: encode
+      env:
+        USER: ${{ github.event.issue.user.login }}
+        TS: ${{ steps.timestamp.outputs.TS }}
+        CHKSUM: ${{ steps.fetch-code.outputs.MD5 }}
+        RESULT: ${{ steps.final-result.outputs.result }}
+      run: |
+        echo "user=$USER" > score.txt
+        echo "timestamp=$TS" >> score.txt
+        echo "checksum=$CHKSUM" >> score.txt
+        echo "result=$RESULT" >> score.txt
+        echo "submitted=$(cat ./stu-code.tar.gz.pgp)" >> score.txt
+        base64 score.txt > score.b64
+
+    - name: Archive the score
+      env:
+        USER: ${{ github.event.issue.user.login }}
+        TS: ${{ steps.timestamp.outputs.TS }}
+      run: |
+        echo -n '{ "message": "score archiver", "committer": { "name": "bot", "email": "bot@bot.org" }, "content": "' > data.json
+        echo -n "$(cat score.b64 | tr -d '\r\n')" >> data.json
+        echo -n '" }' >> data.json
+        curl \
+          -X PUT \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer ${{ secrets.ARCHIVER_PAT }}" \
+          https://api.github.com/repos/ZJU-PPL/scores/contents/lab-2.$TS.$USER.log \
+          --data-binary "@./data.json"
